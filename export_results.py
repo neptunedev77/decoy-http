@@ -3,6 +3,7 @@
 Usage:
     python export_results.py --region "West Europe"
     python export_results.py path/to/logs --out results --sample 50
+    python export_results.py --exclude-ip 198.51.100.7   # drop your own test traffic
 
 Outputs:
     results/summary.json  aggregated statistics + session metadata
@@ -149,8 +150,32 @@ def _final_check(text: str) -> str:
     return mask_ips_in_text(text)
 
 
-def export(inputs: list[str], out_dir: Path, region: str, name: str, sample_size: int, top: int) -> None:
-    events = list(load_events(inputs))
+def _normalise_ip(ip: Any) -> str:
+    try:
+        addr = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return str(ip)
+    if isinstance(addr, ipaddress.IPv6Address) and addr.ipv4_mapped:
+        addr = addr.ipv4_mapped
+    return str(addr)
+
+
+def exclude_sources(events: list[dict[str, Any]], ips: list[str]) -> list[dict[str, Any]]:
+    """Drop events from the given source IPs (e.g. the operator's own tests)."""
+    excluded = {_normalise_ip(ip) for ip in ips}
+    return [e for e in events if _normalise_ip(e.get("src_ip", "")) not in excluded]
+
+
+def export(
+    inputs: list[str],
+    out_dir: Path,
+    region: str,
+    name: str,
+    sample_size: int,
+    top: int,
+    exclude: list[str] | None = None,
+) -> None:
+    events = exclude_sources(list(load_events(inputs)), exclude or [])
     out_dir.mkdir(parents=True, exist_ok=True)
     summary = build_summary(events, region, name, top)
     (out_dir / "summary.json").write_text(
@@ -172,12 +197,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--name", default="Session 1", help="session name")
     parser.add_argument("--sample", type=int, default=50, help="number of sampled requests")
     parser.add_argument("--top", type=int, default=20, help="rows per top-N list")
+    parser.add_argument("--exclude-ip", action="append", default=[], metavar="IP",
+                        help="ignore requests from this source IP (repeatable)")
     args = parser.parse_args(argv)
 
     if not find_log_files(args.inputs):
         print("no log files found", file=sys.stderr)
         return 1
-    export(args.inputs, Path(args.out), args.region, args.name, args.sample, args.top)
+    export(args.inputs, Path(args.out), args.region, args.name, args.sample, args.top,
+           args.exclude_ip)
     return 0
 
 

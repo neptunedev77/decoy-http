@@ -112,6 +112,17 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(summary["categories"]["unknown"], 2)
         self.assertIn("requests_per_minute", summary)
 
+    def test_exclude_ip(self) -> None:
+        out = self.tmp / "filtered"
+        with contextlib.redirect_stdout(io.StringIO()):
+            export_results.main([str(self.tmp / "logs"), "--out", str(out),
+                                 "--exclude-ip", "203.0.113.57", "--exclude-ip", "192.0.2.200"])
+        summary = json.loads((out / "summary.json").read_text())
+        # 3 events from 203.0.113.57 and 1 from ::ffff:192.0.2.200 (IPv4-mapped)
+        self.assertEqual(summary["totals"]["requests"], len(EVENTS) - 4)
+        srcs = {json.loads(l)["src"] for l in (out / "sample.jsonl").read_text().splitlines()}
+        self.assertEqual(srcs, {"198.51.x.x", "2001:db8:x:x:x:x:x:x"})
+
     def test_mask_helpers(self) -> None:
         self.assertEqual(export_results.mask_ip("203.0.113.57"), "203.0.x.x")
         self.assertEqual(export_results.mask_ip("::ffff:192.0.2.1"), "192.0.x.x")
