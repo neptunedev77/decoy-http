@@ -138,7 +138,8 @@ def choose_sample(events: list[dict[str, Any]], size: int, seed: int = 1) -> lis
         for i in rng.sample(by_cat[cat], min(per_cat, len(by_cat[cat]))):
             if i not in chosen and len(chosen) < size:
                 chosen.append(i)
-    rest = [i for i in range(len(events)) if i not in set(chosen)]
+    taken = set(chosen)
+    rest = [i for i in range(len(events)) if i not in taken]
     chosen += rng.sample(rest, min(size - len(chosen), len(rest)))
     return [events[i] for i in sorted(chosen)]
 

@@ -80,7 +80,7 @@ def load_events(inputs: Iterable[str]) -> Iterator[dict[str, Any]]:
             for line in fh:
                 try:
                     event = json.loads(line)
-                except json.JSONDecodeError:
+                except (ValueError, RecursionError):  # corrupt / odd line
                     continue
                 if isinstance(event, dict) and "ts" in event:
                     yield event

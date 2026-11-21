@@ -429,6 +429,7 @@ DISABLED_METHODS = frozenset(
 # --------------------------------------------------------------------------
 
 MAX_CONNECTIONS = 64  # simultaneous connections; extra ones are closed at once
+MAX_CONNECTIONS_PER_IP = 8  # so one slow client cannot take every slot
 SOCKET_TIMEOUT = 10.0  # seconds per socket read/write
 REQUEST_DEADLINE = 20.0  # seconds to receive a whole request (anti-slowloris)
 MAX_REQUEST_LINE = 8 * 1024

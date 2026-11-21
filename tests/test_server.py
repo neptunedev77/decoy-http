@@ -170,6 +170,26 @@ class RobustnessTests(ServerTestCase):
         self.assertTrue(self.last_event()["flags"]["timeout"])
 
 
+class ConnectionLimitTests(ServerTestCase):
+    def test_per_ip_connection_cap(self) -> None:
+        with mock.patch.object(config, "MAX_CONNECTIONS_PER_IP", 2):
+            idle = [socket.create_connection(("127.0.0.1", self.port)) for _ in range(2)]
+            time.sleep(0.2)
+            try:
+                with socket.create_connection(("127.0.0.1", self.port), timeout=3) as s:
+                    s.sendall(b"GET / HTTP/1.1\r\n\r\n")
+                    try:
+                        reply = s.recv(100)
+                    except ConnectionError:
+                        reply = b""
+                self.assertEqual(reply, b"")  # closed without an answer
+            finally:
+                for s in idle:
+                    s.close()
+        time.sleep(0.2)
+        self.assertEqual(self.get("/")[0], 200)  # slots are released again
+
+
 class ProxyTests(ServerTestCase):
     def setUp(self) -> None:
         # A local "upstream" that would receive a connection if we ever proxied.

@@ -495,6 +495,8 @@ class TrapServer(ThreadingHTTPServer):
         self.event_log = EventLog(log_dir, console=console)
         self.rate_limiter = RateLimiter(rate_limit)
         self._slots = threading.BoundedSemaphore(config.MAX_CONNECTIONS)
+        self._per_ip: dict[str, int] = {}
+        self._per_ip_lock = threading.Lock()
         self.dropped_connections = 0
         super().__init__(address, TrapHandler)
 
@@ -508,7 +510,15 @@ class TrapServer(ThreadingHTTPServer):
     def process_request(self, request: Any, client_address: Any) -> None:
         # Limit simultaneous connections: beyond the limit, close at once
         # instead of spawning more threads.
-        if not self._slots.acquire(blocking=False):
+        ip = client_address[0]
+        with self._per_ip_lock:
+            if self._per_ip.get(ip, 0) >= config.MAX_CONNECTIONS_PER_IP:
+                ip = None
+            else:
+                self._per_ip[ip] = self._per_ip.get(ip, 0) + 1
+        if ip is None or not self._slots.acquire(blocking=False):
+            if ip is not None:
+                self._release_ip(ip)
             self.dropped_connections += 1
             self.shutdown_request(request)
             return
@@ -516,13 +526,23 @@ class TrapServer(ThreadingHTTPServer):
             super().process_request(request, client_address)
         except Exception:
             self._slots.release()
+            self._release_ip(ip)
             raise
+
+    def _release_ip(self, ip: str) -> None:
+        with self._per_ip_lock:
+            left = self._per_ip.get(ip, 1) - 1
+            if left > 0:
+                self._per_ip[ip] = left
+            else:
+                self._per_ip.pop(ip, None)
 
     def process_request_thread(self, request: Any, client_address: Any) -> None:
         try:
             super().process_request_thread(request, client_address)
         finally:
             self._slots.release()
+            self._release_ip(client_address[0])
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # Don't dump tracebacks (which may contain client data) to the console.
