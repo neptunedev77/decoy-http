@@ -378,3 +378,77 @@ POST_OVERRIDES: dict[str, FakeResponse] = {
 }
 
 NOT_FOUND = FakeResponse(404, NOT_FOUND_PAGE, "text/html; charset=iso-8859-1")
+
+# --------------------------------------------------------------------------
+# Logging
+# --------------------------------------------------------------------------
+
+LOG_FILE_NAME = "requests.jsonl"
+LOG_MAX_BYTES = 20 * 1024 * 1024  # rotate at 20 MB...
+LOG_BACKUP_COUNT = 9  # ...keeping 9 old files: at most 10 x 20 MB on disk
+MAX_BODY_LOG_BYTES = 8 * 1024  # bodies are logged (never saved as files), truncated
+
+# --------------------------------------------------------------------------
+# Classification rules: (category, regex, parts of the request to search)
+#
+# Parts: "path" (raw + URL-decoded path), "query" (raw + decoded query),
+# "body" (raw + decoded body), "headers" (header values).
+# Matching is case-insensitive. A request can get several categories; if none
+# matches it is "unknown". "proxy-attempt" is set by the server itself.
+# --------------------------------------------------------------------------
+
+_PARAMS = ("query", "body")
+_ALL = ("path", "query", "body", "headers")
+
+CATEGORY_RULES: list[tuple[str, str, tuple[str, ...]]] = [
+    (
+        "sensitive-file-probe",
+        r"/\.(env|git|svn|hg|aws|ssh|docker|vscode|idea|ds_store|htpasswd|htaccess)"
+        r"|/(config|settings|credentials|secrets?|database|parameters)\.(json|ya?ml|php|js|ini|xml|txt|bak)"
+        r"|wp-config|\.(sql|bak|old|swp|tar\.gz|zip)$|/backup|/etc/(passwd|shadow)",
+        ("path",),
+    ),
+    (
+        "wordpress-probe",
+        r"/(wp-(login|admin|content|includes|json|config|cron)|xmlrpc\.php|wordpress)",
+        ("path",),
+    ),
+    (
+        "phpmyadmin-probe",
+        r"/(phpmyadmin|pma|myadmin|mysqladmin|dbadmin|sqladmin|phpmy)",
+        ("path",),
+    ),
+    (
+        "admin-discovery",
+        r"/(admin|administrator|login|manager|cpanel|panel|dashboard|console"
+        r"|server-status|server-info|actuator|jenkins|webadmin|adminer)(?:[/._?-]|$)",
+        ("path",),
+    ),
+    (
+        "path-traversal",
+        r"\.\./|\.\.\\|%2e%2e|%252e|\.\.%2f|%c0%ae|/etc/passwd|win\.ini|boot\.ini",
+        ("path", "query", "body"),
+    ),
+    (
+        "sqli-attempt",
+        r"union(\s|\+|/\*.*?\*/)+(all(\s|\+)+)?select|'\s*or\s*'?\d+'?\s*=\s*'?\d|\bor\s+1\s*=\s*1"
+        r"|sleep\s*\(\s*\d|benchmark\s*\(|information_schema|waitfor\s+delay"
+        r"|extractvalue\s*\(|updatexml\s*\(|'\s*(--|#)",
+        _PARAMS,
+    ),
+    (
+        "command-injection",
+        r"(;|\||&&|\$\(|`)\s*(wget|curl|chmod|sh|bash|cat|id|uname|whoami|nc|busybox|rm|echo|ping|tftp|python|perl|cd)\b"
+        r"|\b(wget|curl)\s+(-\S+\s+)*h[tx]{2}ps?://|chmod\s+(\+x|[0-7]{3})|/bin/(ba)?sh|\$\(",
+        ("path", "query", "body"),
+    ),
+    ("log4shell", r"\$\{\s*jndi\s*:|\$\{[^}]{0,40}(lower|upper|::-)[^}]{0,40}\}", _ALL),
+    ("shellshock", r"\(\s*\)\s*\{", _ALL),
+    (
+        "router-iot-exploit",
+        r"/(boaform|goform|cgi-bin|hnap1|setup\.cgi|shell\b|gponform|tmunblock\.cgi"
+        r"|login\.cgi|apply\.cgi|device\.rsp|onvif|picsdesc\.xml|soap\.cgi"
+        r"|currentsetting\.htm|ctrlt|mgmt|dvr|diag\.cgi|stssys\.htm|wanipcn)",
+        ("path",),
+    ),
+]
