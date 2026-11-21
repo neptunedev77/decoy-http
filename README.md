@@ -216,33 +216,62 @@ paths or payloads.
 
 ### Session 1 (2 h)
 
-_To be completed after the session._
-
 | | |
 |---|---|
-| Date | |
-| Azure region | |
-| Duration | 2 h |
-| Total requests | |
-| Unique source IPs | |
+| Date | 2026-11-21 |
+| Azure region | Denmark East (`denmarkeast`) |
+| Exposure window | 15:54 to 17:54 UTC (2 h) |
+| Total requests | 15 |
+| Unique source IPs | 9 |
+| Malformed requests | 5 |
+
+The operator's own test requests were excluded with `--exclude-ip`. The full export
+is in [`results/summary.json`](results/summary.json) and
+[`results/sample.jsonl`](results/sample.jsonl).
 
 **Requests by category**
 
+A request can have more than one category.
+
 | Category | Requests |
 |---|---|
-| | |
+| `unknown` | 13 |
+| `admin-discovery` | 2 |
+| `sensitive-file-probe` | 1 |
+| `router-iot-exploit` | 1 |
 
 **Most requested paths**
 
 | Path | Requests |
 |---|---|
-| | |
+| `/` | 6 |
+| `/favicon.ico` | 2 |
+| `/admin/config.php` | 1 |
+| `/boaform/adminformLogout//boaform/admin/login.asp` | 1 |
+
+The 5 malformed requests have no path (see below).
 
 **Notable findings**
 
--
-
-**Screenshots**
+- **First contact within 2 minutes.** The first external request arrived at 15:56:32 UTC,
+  two minutes after port 80 was opened: a `HEAD /` with the user-agent `mirai-rs`, a
+  name associated with Mirai-style botnets.
+- **Mostly fingerprinting.** Most traffic was a plain `GET /` (sometimes followed by
+  `/favicon.ico`) from internet-wide scanners, one of which identified itself as
+  `ModatScanner`. These requests map exposed services rather than attack them.
+- **TLS on a plain HTTP port.** A third of all requests (5 of 15) were TLS ClientHello
+  handshakes sent to port 80, from two sources. Scanners try HTTPS on every open port,
+  and the honeypot logged these as malformed and answered with a 400.
+- **Router exploit probe.** One request targeted `/boaform/admin/login.asp`, the login
+  form of the Boa web server found on many fibre routers and ONTs, which is a common
+  target for IoT botnets.
+- **Config file probe.** One request looked for `/admin/config.php`.
+- **No targeted attacks.** No request tried `.env`, `.git/config`, WordPress or
+  phpMyAdmin, and there were no SQL injection, command injection or Log4Shell payloads.
+  Over a 2-hour window on a fresh IP the server was found by scanners but had not yet
+  been listed as a target. Longer sessions would be needed to see exploitation attempts.
+- **Stable under real traffic.** The container ran for the whole session with no
+  restarts, and the rate limit was never triggered.
 
 ## Ethics and privacy
 

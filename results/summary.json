@@ -1,0 +1,124 @@
+{
+  "session": {
+    "name": "Session 1",
+    "region": "denmarkeast",
+    "date": "2026-11-21",
+    "start_utc": "2026-11-21T15:56:32.953000+00:00",
+    "end_utc": "2026-11-21T17:50:26.563000+00:00",
+    "duration_minutes": 113.9,
+    "generated_at_utc": "2026-11-21T19:51:08+00:00"
+  },
+  "totals": {
+    "requests": 15,
+    "unique_source_ips": 9,
+    "flags": {
+      "malformed": 5
+    }
+  },
+  "categories": {
+    "unknown": 13,
+    "admin-discovery": 2,
+    "sensitive-file-probe": 1,
+    "router-iot-exploit": 1
+  },
+  "methods": {
+    "GET": 9,
+    "-": 5,
+    "HEAD": 1
+  },
+  "status_codes": {
+    "200": 6,
+    "400": 5,
+    "404": 4
+  },
+  "top_paths": [
+    {
+      "value": "/",
+      "count": 6
+    },
+    {
+      "value": "/favicon.ico",
+      "count": 2
+    },
+    {
+      "value": "/admin/config.php",
+      "count": 1
+    },
+    {
+      "value": "/boaform/adminformLogout//boaform/admin/login.asp",
+      "count": 1
+    }
+  ],
+  "top_user_agents": [
+    {
+      "value": "",
+      "count": 6
+    },
+    {
+      "value": "Mozilla/5.0",
+      "count": 2
+    },
+    {
+      "value": "Mozilla/5.0 (Macintosh: Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/605.1.15",
+      "count": 2
+    },
+    {
+      "value": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.x.x Safari/537.36 ModatScanner/1.2 (+hxxps://modat[.]io/)",
+      "count": 2
+    },
+    {
+      "value": "mirai-rs",
+      "count": 1
+    },
+    {
+      "value": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      "count": 1
+    },
+    {
+      "value": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:71.0) Gecko/20100101 Firefox/71.0",
+      "count": 1
+    }
+  ],
+  "top_source_prefixes": [
+    {
+      "prefix": "45.55.x.x",
+      "count": 6
+    },
+    {
+      "prefix": "85.217.x.x",
+      "count": 3
+    },
+    {
+      "prefix": "45.198.x.x",
+      "count": 2
+    },
+    {
+      "prefix": "43.228.x.x",
+      "count": 1
+    },
+    {
+      "prefix": "167.250.x.x",
+      "count": 1
+    },
+    {
+      "prefix": "117.209.x.x",
+      "count": 1
+    },
+    {
+      "prefix": "71.6.x.x",
+      "count": 1
+    }
+  ],
+  "requests_per_minute": {
+    "2026-11-21 15:56": 1,
+    "2026-11-21 16:20": 1,
+    "2026-11-21 16:22": 1,
+    "2026-11-21 16:46": 3,
+    "2026-11-21 16:47": 3,
+    "2026-11-21 16:51": 1,
+    "2026-11-21 17:28": 1,
+    "2026-11-21 17:36": 1,
+    "2026-11-21 17:47": 2,
+    "2026-11-21 17:50": 1
+  }
+}
