@@ -379,6 +379,67 @@ POST_OVERRIDES: dict[str, FakeResponse] = {
 
 NOT_FOUND = FakeResponse(404, NOT_FOUND_PAGE, "text/html; charset=iso-8859-1")
 
+
+def apache_error(status: int, title: str, message: str, **kwargs) -> FakeResponse:
+    """Apache-style error page. `message` is static text, never client input."""
+    page = (
+        '<!DOCTYPE HTML PUBLIC "-//IETF//DTD HTML 2.0//EN">\n'
+        f"<html><head>\n<title>{status} {title}</title>\n</head><body>\n"
+        f"<h1>{title}</h1>\n<p>{message}<br />\n</p>\n<hr>\n"
+        f"<address>{SERVER_HEADER} Server at {SERVER_NAME} Port {SERVER_PORT_LABEL}</address>\n"
+        "</body></html>\n"
+    )
+    return FakeResponse(status, page, "text/html; charset=iso-8859-1", **kwargs)
+
+
+ALLOWED_METHODS = "GET,POST,OPTIONS,HEAD"
+
+BAD_REQUEST = apache_error(
+    400, "Bad Request", "Your browser sent a request that this server could not understand."
+)
+URI_TOO_LONG = apache_error(
+    414, "Request-URI Too Long", "The requested URL's length exceeds the capacity limit for this server."
+)
+REQUEST_TIMEOUT = apache_error(
+    408, "Request Timeout", "Server timeout waiting for the HTTP request from the client."
+)
+METHOD_NOT_ALLOWED = apache_error(
+    405, "Method Not Allowed", "The requested method is not allowed for this URL.",
+    headers=(("Allow", ALLOWED_METHODS),),
+)
+NOT_IMPLEMENTED = apache_error(
+    501, "Not Implemented", "The requested method is not supported for this URL.",
+    headers=(("Allow", ALLOWED_METHODS),),
+)
+TOO_MANY_REQUESTS = apache_error(
+    429, "Too Many Requests", "The user has sent too many requests in a given amount of time.",
+    headers=(("Retry-After", "60"),),
+)
+OPTIONS_RESPONSE = FakeResponse(200, "", headers=(("Allow", ALLOWED_METHODS),))
+
+# Methods that get 405 (known, but "disabled" on this server). TRACE is here on
+# purpose: answering it would mean echoing the request back.
+DISABLED_METHODS = frozenset(
+    {"PUT", "DELETE", "PATCH", "TRACE", "PROPFIND", "PROPPATCH", "MKCOL",
+     "COPY", "MOVE", "LOCK", "UNLOCK", "SEARCH"}
+)
+
+# --------------------------------------------------------------------------
+# Limits (anti-abuse / DoS)
+# --------------------------------------------------------------------------
+
+MAX_CONNECTIONS = 64  # simultaneous connections; extra ones are closed at once
+SOCKET_TIMEOUT = 10.0  # seconds per socket read/write
+REQUEST_DEADLINE = 20.0  # seconds to receive a whole request (anti-slowloris)
+MAX_REQUEST_LINE = 8 * 1024
+MAX_HEADER_LINE = 8 * 1024
+MAX_HEADERS = 64
+MAX_HEADERS_TOTAL = 32 * 1024
+# Body beyond MAX_BODY_LOG_BYTES is read up to this many bytes and discarded.
+MAX_BODY_DRAIN_BYTES = 64 * 1024
+RATE_LIMIT_PER_MINUTE = 120  # per source IP; above this: short log + 429
+RATE_LIMIT_MAX_TRACKED_IPS = 50_000  # bounds the memory used by the limiter
+
 # --------------------------------------------------------------------------
 # Logging
 # --------------------------------------------------------------------------
@@ -394,7 +455,8 @@ MAX_BODY_LOG_BYTES = 8 * 1024  # bodies are logged (never saved as files), trunc
 # Parts: "path" (raw + URL-decoded path), "query" (raw + decoded query),
 # "body" (raw + decoded body), "headers" (header values).
 # Matching is case-insensitive. A request can get several categories; if none
-# matches it is "unknown". "proxy-attempt" is set by the server itself.
+# matches it is "unknown". "proxy-attempt" is set by the server itself
+# (CONNECT method or absolute-URI / authority-form request target).
 # --------------------------------------------------------------------------
 
 _PARAMS = ("query", "body")

@@ -3,10 +3,13 @@
 The server is a passive recorder. Every byte received is untrusted data that
 is only parsed into strings. It is never executed, evaluated, deserialised,
 used as a filesystem path or used to open a network connection.
+
+Responses come only from static content in config.py, looked up by exact path.
 """
 
 from __future__ import annotations
 
+import argparse
 import base64
 import json
 import logging
@@ -15,6 +18,8 @@ import re
 import socket
 import socketserver
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from email.utils import formatdate
 from http.server import ThreadingHTTPServer
@@ -31,6 +36,9 @@ STATUS_TEXT = {
     400: "Bad Request",
     404: "Not Found",
     405: "Method Not Allowed",
+    408: "Request Timeout",
+    414: "Request-URI Too Long",
+    429: "Too Many Requests",
     501: "Not Implemented",
 }
 
@@ -108,9 +116,9 @@ def _sanitize_tree(value: Any) -> Any:
 
 
 class EventLog:
-    def __init__(self, log_dir: str | Path) -> None:
+    def __init__(self, log_dir: str | Path, console: bool = True) -> None:
         Path(log_dir).mkdir(parents=True, exist_ok=True)
-        # A private Logger instance (not registered globally) so several
+        # Private Logger instances (not registered globally) so several
         # servers, e.g. in tests, never share handlers.
         self._file = logging.Logger("decoy-http.requests")
         handler = RotatingFileHandler(
@@ -122,11 +130,12 @@ class EventLog:
         handler.setFormatter(logging.Formatter("%(message)s"))
         self._file.addHandler(handler)
         self._console = logging.Logger("decoy-http.console")
-        self._console.addHandler(logging.StreamHandler(sys.stdout))
+        if console:
+            self._console.addHandler(logging.StreamHandler(sys.stdout))
 
     def write(self, event: dict[str, Any]) -> None:
         event = _sanitize_tree(event)
-        # ensure_ascii also escapes any non-ASCII byte as \uXXXX.
+        # ensure_ascii also escapes any non-ASCII character as \uXXXX.
         self._file.info(json.dumps(event, ensure_ascii=True))
         self._console.info(_summary_line(event))
 
@@ -156,33 +165,79 @@ def _now_iso() -> str:
 
 
 # --------------------------------------------------------------------------
-# HTTP handling
+# Rate limiting (fixed one-minute window per IP, in memory)
+# --------------------------------------------------------------------------
+
+
+class RateLimiter:
+    def __init__(self, limit: int, window: float = 60.0) -> None:
+        self.limit = limit
+        self.window = window
+        self._hits: dict[str, tuple[float, int]] = {}
+        self._lock = threading.Lock()
+
+    def allow(self, ip: str) -> bool:
+        now = time.monotonic()
+        with self._lock:
+            start, count = self._hits.get(ip, (now, 0))
+            if now - start >= self.window:
+                start, count = now, 0
+            self._hits[ip] = (start, count + 1)
+            if len(self._hits) > config.RATE_LIMIT_MAX_TRACKED_IPS:
+                # Bound memory: forget expired windows (or everything).
+                self._hits = {
+                    k: v for k, v in self._hits.items() if now - v[0] < self.window
+                }
+                if len(self._hits) > config.RATE_LIMIT_MAX_TRACKED_IPS:
+                    self._hits.clear()
+            return count + 1 <= self.limit
+
+
+# --------------------------------------------------------------------------
+# Bounded socket reader
 # --------------------------------------------------------------------------
 
 
 class SocketReader:
-    """Minimal buffered reader on top of the raw socket."""
+    """Buffered reader with per-read timeouts and an overall deadline.
 
-    def __init__(self, sock: socket.socket) -> None:
+    The deadline stops slowloris-style clients that trickle one byte at a
+    time: each recv() is given only the time left for the whole request.
+    """
+
+    def __init__(self, sock: socket.socket, deadline: float) -> None:
         self.sock = sock
+        self.deadline = deadline
         self.buf = bytearray()
+        self.received = 0
 
     def _fill(self) -> bool:
+        remaining = self.deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError("request deadline exceeded")
+        self.sock.settimeout(min(config.SOCKET_TIMEOUT, remaining))
         chunk = self.sock.recv(4096)
         if not chunk:
             return False
+        self.received += len(chunk)
         self.buf += chunk
         return True
 
-    def readline(self) -> bytes:
-        while b"\n" not in self.buf:
+    def readline(self, limit: int) -> tuple[bytes, bool]:
+        """Return (line, too_long). Never buffers much more than `limit`."""
+        while b"\n" not in self.buf and len(self.buf) <= limit:
             if not self._fill():
                 break
-        idx = self.buf.find(b"\n")
-        end = len(self.buf) if idx < 0 else idx + 1
-        line = bytes(self.buf[:end])
-        del self.buf[:end]
-        return line
+        idx = self.buf.find(b"\n", 0, limit + 1)
+        if idx < 0:
+            if len(self.buf) > limit:
+                line = bytes(self.buf[:limit])
+                del self.buf[:limit]
+                return line, True
+            idx = len(self.buf) - 1  # EOF without newline
+        line = bytes(self.buf[: idx + 1])
+        del self.buf[: idx + 1]
+        return line, False
 
     def read(self, n: int) -> bytes:
         while len(self.buf) < n:
@@ -192,18 +247,60 @@ class SocketReader:
         del self.buf[:n]
         return data
 
+    def discard(self, n: int) -> None:
+        """Read and throw away up to n bytes (best effort)."""
+        try:
+            while n > 0:
+                if not self.buf and not self._fill():
+                    return
+                take = min(n, len(self.buf))
+                del self.buf[:take]
+                n -= take
+        except OSError:  # includes timeouts
+            return
 
-def choose_response(method: str, path: str) -> config.FakeResponse:
+
+# --------------------------------------------------------------------------
+# HTTP handling
+# --------------------------------------------------------------------------
+
+_METHOD_RE = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,32}$")
+_VERSION_RE = re.compile(r"^HTTP/\d\.\d$")
+_ABSOLUTE_URI_RE = re.compile(r"^[a-zA-Z][a-zA-Z0-9+.-]*://")
+
+
+class BadRequest(Exception):
+    def __init__(self, response: config.FakeResponse = config.BAD_REQUEST) -> None:
+        super().__init__(response.status)
+        self.response = response
+
+
+def is_proxy_attempt(method: str, target: str) -> bool:
+    if method == "CONNECT":
+        return True
+    # Absolute URI ("http://other.host/...") or authority form ("host:443").
+    return bool(_ABSOLUTE_URI_RE.match(target)) or not (
+        target.startswith("/") or target == "*"
+    )
+
+
+def choose_response(method: str, target: str, path: str) -> config.FakeResponse:
     """Pick a static response. `path` is only ever used as a dict key."""
+    if method == "CONNECT":
+        return config.METHOD_NOT_ALLOWED  # never tunnel
+    if is_proxy_attempt(method, target):
+        return config.BAD_REQUEST  # never forward
+    if method == "OPTIONS":
+        return config.OPTIONS_RESPONSE
     if method in ("GET", "HEAD"):
         return config.ENDPOINTS.get(path, config.NOT_FOUND)
     if method == "POST":
         if path in config.POST_OVERRIDES:
             return config.POST_OVERRIDES[path]
         return config.ENDPOINTS.get(path, config.NOT_FOUND)
-    return config.FakeResponse(
-        501, "<h1>Not Implemented</h1>\n", headers=(("Allow", "GET,POST,HEAD"),)
-    )
+    if method in config.DISABLED_METHODS:
+        return config.METHOD_NOT_ALLOWED
+    return config.NOT_IMPLEMENTED
 
 
 def _body_fields(body: bytes) -> dict[str, Any]:
@@ -213,88 +310,6 @@ def _body_fields(body: bytes) -> dict[str, Any]:
         return {"body": base64.b64encode(body).decode("ascii"), "body_encoding": "base64"}
 
 
-class TrapHandler(socketserver.BaseRequestHandler):
-    server: TrapServer
-
-    def handle(self) -> None:
-        ip, port = self.client_address[0], self.client_address[1]
-        event: dict[str, Any] = {
-            "ts": _now_iso(),
-            "src_ip": ip,
-            "src_port": port,
-            "flags": {"truncated": False, "rate_limited": False, "malformed": False},
-        }
-        reader = SocketReader(self.request)
-
-        request_line = _decode(reader.readline())
-        event["request_line"] = request_line.rstrip("\r\n")
-        parts = request_line.split()
-        if len(parts) != 3:
-            event["flags"]["malformed"] = True
-            event["categories"] = ["unknown"]
-            self.send(config.FakeResponse(400, "<h1>Bad Request</h1>\n"), "GET", event)
-            return
-        method, target, version = parts
-
-        headers: list[tuple[str, str]] = []
-        while True:
-            line = reader.readline()
-            if line in (b"\r\n", b"\n", b""):
-                break
-            name, sep, value = _decode(line).partition(":")
-            if not sep:
-                event["flags"]["malformed"] = True
-            headers.append((name.strip(), value.strip()))
-
-        length = 0
-        for name, value in headers:
-            if name.lower() == "content-length" and value.isdigit():
-                length = int(value)
-        body = reader.read(min(length, config.MAX_BODY_LOG_BYTES))
-        if length > len(body):
-            event["flags"]["truncated"] = True
-
-        raw_path, _, query = target.split("#", 1)[0].partition("?")
-        body_text = _decode(body)
-        event.update(
-            method=method,
-            target=target,
-            path=raw_path,
-            query_raw=query,
-            query=_parse_query(query),
-            http_version=version,
-            headers=[[n, v] for n, v in headers],
-            user_agent=next((v for n, v in headers if n.lower() == "user-agent"), ""),
-            body_length=length,
-            body_logged_bytes=len(body),
-            **_body_fields(body),
-            categories=classify(raw_path, query, body_text, headers),
-        )
-        self.send(choose_response(method, unquote(raw_path)), method, event)
-
-    def send(self, resp: config.FakeResponse, method: str, event: dict[str, Any]) -> None:
-        event["status"] = resp.status
-        try:
-            body = resp.body.encode("utf-8")
-            lines = [
-                f"HTTP/1.1 {resp.status} {STATUS_TEXT.get(resp.status, '')}",
-                f"Date: {formatdate(usegmt=True)}",
-                f"Server: {config.SERVER_HEADER}",
-            ]
-            if resp.php:
-                lines.append(f"X-Powered-By: {config.X_POWERED_BY}")
-            lines += [f"{k}: {v}" for k, v in resp.headers]
-            lines += [
-                f"Content-Length: {len(body)}",
-                f"Content-Type: {resp.content_type}",
-                "Connection: close",
-            ]
-            head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
-            self.request.sendall(head if method == "HEAD" else head + body)
-        finally:
-            self.server.event_log.write(event)
-
-
 def _parse_query(query: str) -> dict[str, list[str]]:
     try:
         return parse_qs(query, keep_blank_values=True, max_num_fields=100)
@@ -302,11 +317,183 @@ def _parse_query(query: str) -> dict[str, list[str]]:
         return {}
 
 
+class TrapHandler(socketserver.BaseRequestHandler):
+    server: TrapServer
+
+    def handle(self) -> None:
+        started = time.monotonic()
+        event: dict[str, Any] = {
+            "ts": _now_iso(),
+            "src_ip": self.client_address[0],
+            "src_port": self.client_address[1],
+            "flags": {
+                "truncated": False,
+                "rate_limited": False,
+                "malformed": False,
+                "timeout": False,
+            },
+        }
+        reader = SocketReader(self.request, started + config.REQUEST_DEADLINE)
+        # An exception in one request must never take the server down: every
+        # error is caught here, logged as a flag, and the connection closed.
+        try:
+            response = self._process(reader, event)
+        except BadRequest as exc:
+            event["flags"]["malformed"] = True
+            response = exc.response
+        except TimeoutError:
+            event["flags"]["timeout"] = True
+            response = config.REQUEST_TIMEOUT if reader.received else None
+        except OSError:
+            event["flags"]["connection_error"] = True
+            response = None
+        except Exception as exc:  # defensive: unexpected parser bug
+            event["error"] = type(exc).__name__
+            response = config.BAD_REQUEST
+
+        if reader.received == 0:
+            return  # bare TCP connect with no data: nothing to record
+
+        event.setdefault("categories", ["unknown"])
+        if response is not None:
+            event["status"] = response.status
+            self._send(response, event.get("method", ""))
+        event["duration_ms"] = round((time.monotonic() - started) * 1000)
+        try:
+            self.server.event_log.write(event)
+        except Exception as exc:  # e.g. disk full: keep serving
+            print(f"log write failed: {type(exc).__name__}", file=sys.stderr)
+
+    def _process(self, reader: SocketReader, event: dict[str, Any]) -> config.FakeResponse:
+        flags = event["flags"]
+
+        # --- request line -------------------------------------------------
+        raw_line, too_long = reader.readline(config.MAX_REQUEST_LINE)
+        request_line = _decode(raw_line).rstrip("\r\n")
+        event["request_line"] = request_line[:1024]
+        if too_long:
+            flags["truncated"] = True
+            raise BadRequest(config.URI_TOO_LONG)
+        parts = request_line.split()
+        if len(parts) != 3 or not _METHOD_RE.match(parts[0]) or not _VERSION_RE.match(parts[2]):
+            raise BadRequest()
+        method, target, version = parts
+        raw_path, _, query = target.split("#", 1)[0].partition("?")
+        event.update(
+            method=method,
+            target=target,
+            path=raw_path,
+            query_raw=query,
+            http_version=version,
+        )
+        if is_proxy_attempt(method, target):
+            event["categories"] = ["proxy-attempt"]
+
+        # --- headers --------------------------------------------------------
+        headers: list[tuple[str, str]] = []
+        event["headers"] = headers
+        total = 0
+        while True:
+            raw, too_long = reader.readline(config.MAX_HEADER_LINE)
+            total += len(raw)
+            if too_long or total > config.MAX_HEADERS_TOTAL:
+                flags["truncated"] = True
+                raise BadRequest()
+            if raw in (b"\r\n", b"\n", b""):
+                break
+            line = _decode(raw).rstrip("\r\n")
+            if line[:1] in (" ", "\t") and headers:  # obsolete line folding
+                name, value = headers[-1]
+                headers[-1] = (name, value + " " + line.strip())
+                continue
+            name, sep, value = line.partition(":")
+            if not sep:
+                flags["malformed"] = True
+            headers.append((name.strip(), value.strip()))
+            if len(headers) > config.MAX_HEADERS:
+                flags["truncated"] = True
+                raise BadRequest()
+
+        def header(name: str) -> list[str]:
+            return [v for n, v in headers if n.lower() == name]
+
+        event["user_agent"] = (header("user-agent") or [""])[0]
+
+        # --- rate limit -----------------------------------------------------
+        if not self.server.rate_limiter.allow(event["src_ip"]):
+            # Short record only: no headers, no body.
+            flags["rate_limited"] = True
+            del event["headers"]
+            event["path"] = raw_path[:200]
+            event["categories"] = event.get("categories") or classify(raw_path, query, "", [])
+            return config.TOO_MANY_REQUESTS
+
+        # --- body -----------------------------------------------------------
+        lengths = set(header("content-length"))
+        length = 0
+        if len(lengths) > 1 or (lengths and not next(iter(lengths)).isdigit()):
+            raise BadRequest()
+        if lengths:
+            length = int(next(iter(lengths)))
+        if any("chunked" in v.lower() for v in header("transfer-encoding")):
+            flags["body_not_read"] = True  # chunked bodies are not decoded
+            length = 0
+
+        # Fill in everything we know before reading the body, so a timeout
+        # while reading it still produces a useful record.
+        event.update(query=_parse_query(query), body_length=length)
+        body = reader.read(min(length, config.MAX_BODY_LOG_BYTES))
+        if length > len(body):
+            flags["truncated"] = True
+            reader.discard(min(length - len(body), config.MAX_BODY_DRAIN_BYTES))
+        event.update(body_logged_bytes=len(body), **_body_fields(body))
+
+        categories = classify(raw_path, query, _decode(body), headers)
+        if "proxy-attempt" in event.get("categories", []):
+            categories = ["proxy-attempt"] + [c for c in categories if c != "unknown"]
+        event["categories"] = categories
+        return choose_response(method, target, unquote(raw_path))
+
+    def _send(self, resp: config.FakeResponse, method: str) -> None:
+        body = resp.body.encode("utf-8")
+        # Only static values go into the response head: nothing from the
+        # request is ever reflected back.
+        lines = [
+            f"HTTP/1.1 {resp.status} {STATUS_TEXT.get(resp.status, '')}",
+            f"Date: {formatdate(usegmt=True)}",
+            f"Server: {config.SERVER_HEADER}",
+        ]
+        if resp.php:
+            lines.append(f"X-Powered-By: {config.X_POWERED_BY}")
+        lines += [f"{k}: {v}" for k, v in resp.headers]
+        lines += [
+            f"Content-Length: {len(body)}",
+            f"Content-Type: {resp.content_type}",
+            "Connection: close",
+        ]
+        head = ("\r\n".join(lines) + "\r\n\r\n").encode("latin-1")
+        try:
+            self.request.settimeout(config.SOCKET_TIMEOUT)
+            self.request.sendall(head if method == "HEAD" else head + body)
+        except OSError:
+            pass
+
+
 class TrapServer(ThreadingHTTPServer):
     daemon_threads = True
+    block_on_close = False
 
-    def __init__(self, address: tuple[str, int], log_dir: str | Path) -> None:
-        self.event_log = EventLog(log_dir)
+    def __init__(
+        self,
+        address: tuple[str, int],
+        log_dir: str | Path,
+        rate_limit: int = config.RATE_LIMIT_PER_MINUTE,
+        console: bool = True,
+    ) -> None:
+        self.event_log = EventLog(log_dir, console=console)
+        self.rate_limiter = RateLimiter(rate_limit)
+        self._slots = threading.BoundedSemaphore(config.MAX_CONNECTIONS)
+        self.dropped_connections = 0
         super().__init__(address, TrapHandler)
 
     def server_bind(self) -> None:
@@ -316,13 +503,48 @@ class TrapServer(ThreadingHTTPServer):
         self.server_name = config.SERVER_NAME
         self.server_port = self.server_address[1]
 
+    def process_request(self, request: Any, client_address: Any) -> None:
+        # Limit simultaneous connections: beyond the limit, close at once
+        # instead of spawning more threads.
+        if not self._slots.acquire(blocking=False):
+            self.dropped_connections += 1
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._slots.release()
+            raise
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # Don't dump tracebacks (which may contain client data) to the console.
+        print(f"handler error: {sys.exc_info()[0].__name__}", file=sys.stderr)
+
     def server_close(self) -> None:
         super().server_close()
         self.event_log.close()
 
 
-def main() -> None:
-    host = os.environ.get("DECOY_HOST", "0.0.0.0")
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="decoy-http honeypot")
+    parser.add_argument(
+        "--local",
+        action="store_true",
+        help="bind only to 127.0.0.1 (safe local testing, nothing exposed)",
+    )
+    args = parser.parse_args(argv)
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        print("refusing to run as root", file=sys.stderr)
+        return 1
+
+    host = "127.0.0.1" if args.local else os.environ.get("DECOY_HOST", "0.0.0.0")
     port = int(os.environ.get("DECOY_PORT", "8080"))
     log_dir = os.environ.get("DECOY_LOG_DIR", "logs")
     with TrapServer((host, port), log_dir) as server:
@@ -331,6 +553,7 @@ def main() -> None:
             server.serve_forever()
         except KeyboardInterrupt:
             pass
+    return 0
 
 
 if __name__ == "__main__":
