@@ -355,14 +355,16 @@ class TrapHandler(socketserver.BaseRequestHandler):
             return  # bare TCP connect with no data: nothing to record
 
         event.setdefault("categories", ["unknown"])
-        if response is not None:
-            event["status"] = response.status
-            self._send(response, event.get("method", ""))
+        event["status"] = response.status if response is not None else None
         event["duration_ms"] = round((time.monotonic() - started) * 1000)
+        # Log before answering, so the record exists by the time the client
+        # sees the response.
         try:
             self.server.event_log.write(event)
         except Exception as exc:  # e.g. disk full: keep serving
             print(f"log write failed: {type(exc).__name__}", file=sys.stderr)
+        if response is not None:
+            self._send(response, event.get("method", ""))
 
     def _process(self, reader: SocketReader, event: dict[str, Any]) -> config.FakeResponse:
         flags = event["flags"]

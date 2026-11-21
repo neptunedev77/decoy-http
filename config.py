@@ -488,7 +488,7 @@ CATEGORY_RULES: list[tuple[str, str, tuple[str, ...]]] = [
     ),
     (
         "path-traversal",
-        r"\.\./|\.\.\\|%2e%2e|%252e|\.\.%2f|%c0%ae|/etc/passwd|win\.ini|boot\.ini",
+        r"\.\./|\.\.\\|%2e%2e|%252e|\.\.%2f|%c0%a[ef]|%e0%80%af|/etc/passwd|win\.ini|boot\.ini",
         ("path", "query", "body"),
     ),
     (
