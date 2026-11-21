@@ -1,0 +1,6 @@
+# Local test mode: publish only on 127.0.0.1, nothing exposed to the network.
+#   docker compose -f docker-compose.yml -f docker-compose.local.yml up --build
+services:
+  decoy:
+    ports: !override
+      - "127.0.0.1:8080:8080"

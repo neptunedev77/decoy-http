@@ -1,0 +1,4 @@
+# Only the server code goes into the image.
+*
+!trap.py
+!config.py
